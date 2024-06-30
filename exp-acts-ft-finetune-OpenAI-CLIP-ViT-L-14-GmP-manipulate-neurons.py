@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from sklearn.metrics import f1_score, accuracy_score
 import warnings
 warnings.filterwarnings("ignore")
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import gmpclip as clip
 from torch.optim import AdamW
@@ -71,7 +73,13 @@ def monitor_gradient_norms(gradient_norms, threshold=1e-5):
         # Optionally, you could also implement some automatic adjustment strategies here
 
 def plot_gradient_norms(gradient_norms, epoch, use_log_scale=True):
-    plt.figure(figsize=(20, 10))
+    try:
+        plt.figure(figsize=(20, 10))
+
+    except:
+        print(f"Error in plotting gradient norms: {e}")
+        with open(f"{plots_folder}/gradient_norms_epoch_{epoch}.json", 'w') as f:
+            json.dump(gradient_norms, f)
     
     # Choose a colormap
     cmap = plt.get_cmap('Spectral')
@@ -251,9 +259,9 @@ model, preprocess = clip.load(clipmodel, device=device)
 unfreeze_all = True
 
 EPOCHS = 20
-max_learning_rate = 5e-7
-learning_rate = 3e-7
-batch_size = 40
+max_learning_rate = 7.19e-7
+learning_rate = 1.25e-6
+batch_size = 230
 
 # Define your training dataset and dataloader, or use below to reproduce results
 dataset1 = ImageTextDataset("path/to/images/COCO/data-square", "path/to/COCO/data-square/short-coco-sprite-train-0_9.json", transform=preprocess)
