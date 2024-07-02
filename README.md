@@ -1,3 +1,14 @@
+This fork is used as our lab to fine tuning our Diffusion t2i model, thanks to the original creator who make seperate CLIP Finetune method.
+
+This fork is including:
+- PyCapsule_New called with null pointer Error due to messy dataset that has broken image on your folder
+- Included CSVMaker, so you don't need chatgpting anymore :)
+- Experimental ViT-G training. This CLIP model is user friendly with consumer GPU card. So our plan is to modify the script to be able run on multi-gpu or HPC cluster
+
+
+___
+Original README
+
 ## ⭐ Summary: 
 This repo is for fine-tuning CLIP in the command line. It does not add custom nodes to ComfyUI; however, you can easily use your fine-tune with ComfyUI:
 - First, fine-tune with ft-B-train-OpenAI-CLIP-ViT-L-14.py
