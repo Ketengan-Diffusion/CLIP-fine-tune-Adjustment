@@ -263,6 +263,8 @@ def preprocess(images, texts):
 
 unfreeze_all = True
 
+# Training configuration
+# This configuraation is tested on 1 x Nvidia A100. I don't know will this setting will winning the CLIP heart :v
 EPOCHS = 20
 batch_size = 20
 max_learning_rate = 1e-7
