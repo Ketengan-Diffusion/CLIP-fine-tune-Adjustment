@@ -257,14 +257,12 @@ def preprocess(images, texts):
     return inputs['pixel_values'], inputs['input_ids']
 
 #For continuing training a model checkpoint
-#_, preprocess = clip.load(clipmodel, device=device)
-#model = torch.load("continue/training/my/finetune.pt")
-#model = model.cuda()
+model = torch.load("ft-checkpoints/clip_ft_100.pt")
+model = model.to(device)
+processor = CLIPProcessor.from_pretrained(clipmodel)
 
 unfreeze_all = True
 
-# Training configuration
-# This configuraation is tested on 1 x Nvidia A100. I don't know will this setting will winning the CLIP heart :v
 EPOCHS = 20
 batch_size = 20
 max_learning_rate = 1e-7
