@@ -17,7 +17,121 @@ This repo is for fine-tuning CLIP in the command line. It does not add custom no
 - Then, for both fine-tune scripts, use ft-C-convert-for-SDXL-comfyUI-OpenAI-CLIP.py
 - Now you have a state_dict you can plug into ComfyUI for use with SD / SDXL!
 ### 👇 Scroll all the way down for step-by-step instructions with ComfyUI! 👇
+### ‼️ Don't want to fine-tune? You can download the model here: [https://huggingface.co/zer0int](https://huggingface.co/zer0int)
+-------
+## Changes 23/OKT/2024:
+Added folder `Convert-for-HuggingFace-Spaces-etc`
 
+- Includes the [convert_clip_original_pytorch_to_hf.py](https://github.com/huggingface/transformers/blob/main/src/transformers/models/clip/convert_clip_original_pytorch_to_hf.py) script from HuggingFace + configuration .json files.
+- Includes optional code to subsequently extract the Text Encoder only model (e.g. for Flux.1 guidance)
+- Includes optional code to add metadata `{"format": "pt"}` - use it in case you get an error about 'pt'!
+- Please check the included `how-to-use.txt` & code comments for details
+----
+## Changes 22/OKT/2024:
+Added `a-loss-to-penalize-overfit-via-entropy.py`
+
+- A custom loss with an `entropy penalty` term that penalizes over-confidence (overfit)
+- For a diverse and general (!) dataset, the results of fine-tuning are good, but slightly worse than without entropy penalty (fine-tune on COCO-SPRIGHT):
+
+1. ImageNet/ObjectNet accuracy without entropy penalty: 0.845 -> 0.914
+2. ImageNet/ObjectNet accuracy with entropy penalty: 0.845 -> 0.908
+
+- Alas, I don't want to integrate this loss into the 'best' working code; whether or not it is useful depends entirely on your dataset. If you have a very narrow dataset (e.g. just sneakers), however, and you find CLIP to begin overfitting (val loss increasing) before it has converged to a good (low) loss, then this entropy penalty could be very useful. Simply replace the loss in the actual training script if you observe overfitting, and tinker with the `lambda_entropy` factor. Actual example from `log_train.txt` of `1.`:
+```
+Epoch n:
+Validation Acc: 0.9012, Validation F1: 0.8749
+Training Loss: 0.6043, Validation Loss: 1.1853
+Epoch n+1:
+Validation Acc: 0.8942, Validation F1: 0.8652 <- decrease
+Training Loss: 0.6018, Validation Loss: 1.1894 <- increase
+```
+Now, for the diverse dataset, this was *overtraining*, not *overfitting*; the model had already converged (good Acc/F1, low loss). In this case, early stopping (or saving checkpoints every epoch, then hand-selecting the best one - an earlier one, in this case) is recommended. However, I did not observe such an uptick with entropy penalty for a few epochs of overtraining (albeit the model converged at less ideal `Validation Acc: 0.8902, Validation F1: 0.8600`). So, give it a try if you see CLIP do this with your dataset (very extreme example; better to check `log_train.txt` to catch it early!):
+
+![extreme-example-sm](https://github.com/user-attachments/assets/bd466dd8-f40d-4ac8-bdf1-cb5ac8fa9c80)
+
+----
+## Changes 11/AUG/2024:
+
+- Added `ft-C-convert-with-org-dtype-fp16.py` -> Save with mixed precision as per OpenAI, model size ~900 MB
+- Added `ft-C-convert-to-safetensors.py` -> Should be obvious, but check code comments for details. :-)
+- ### ✨ Added `exp-acts-ft-SMOOTH-finetune-OpenAI-CLIP-ViT-L-14-GmP.py` 🥳
+- This is the same as `exp-acts-ft-finetune-OpenAI-CLIP-ViT-L-14-GmP-manipulate-neurons.py`
+- BUT it introduces label smoothing and a custom loss function for CLIP (CLIP doesn't have discrete 'classes').
+- In general: Label smoothing is a regularization technique that softens the target labels by assigning a small probability to incorrect classes, rather than using hard one-hot labels. This approach prevents the model from becoming overly confident in its predictions, encouraging better generalization and reducing the risk of overfitting, especially in cases where the data might be noisy or limited in diversity.
+- Read more in the paper [When Does Label Smoothing Help? / Google Brain](https://arxiv.org/abs/1906.02629).
+----
+- Is it for me? 🤔
+- If you have a small dataset or suboptimal labels or are GPU-poor (24/48 GB VRAM), or all of that:
+- YES! This *may* improve your results quite dramatically! 🤓💡
+----
+It even further improved the results for the high-quality COCO-40K-SPRIGHT dataset to >91% accuracy, trained on 1x RTX4090 🤯:
+
+![gmp-models-extreme-plot-all-evals](https://github.com/user-attachments/assets/d3838637-46c4-469e-98fc-832cfc065f90)
+
+- You can download this model on [my HuggingFace](https://huggingface.co/zer0int/CLIP-GmP-ViT-L-14) if you don't want to reproduce the fine-tune with the provided code. :-)
+
+- Technical / code summary of changes:
+
+## Normal Contrastive Loss.
+
+```
+class ContrastiveLoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super(ContrastiveLoss, self).__init__()
+        self.temperature = temperature
+        self.criterion = nn.CrossEntropyLoss()
+
+    def forward(self, logits_per_image, logits_per_text):
+        # Normalize the features to avoid overflow or underflow
+        logits_per_image = F.normalize(logits_per_image, p=2, dim=1)
+        logits_per_text = F.normalize(logits_per_text, p=2, dim=1)
+
+        # Calculate logits
+        logits = torch.matmul(logits_per_image, logits_per_text.t()) / self.temperature
+        labels = torch.arange(logits.size(0), device=logits.device)
+
+        # Calculate loss as the mean of the two cross-entropy losses
+        loss_img = self.criterion(logits, labels)
+        loss_txt = self.criterion(logits.t(), labels)
+
+        return (loss_img + loss_txt) / 2
+```
+
+## New Custom Loss.
+- Shout out to GPT-4o, my team-mate, for implementation help! 🤓🤝🤖
+
+```
+class ContrastiveLoss(nn.Module):
+    def __init__(self, temperature=0.07, smoothing=0.1):
+        super(ContrastiveLoss, self).__init__()
+        self.temperature = temperature
+        self.smoothing = smoothing
+
+    def forward(self, logits_per_image, logits_per_text):
+        # Normalize the features to avoid overflow or underflow
+        logits_per_image = F.normalize(logits_per_image, p=2, dim=1)
+        logits_per_text = F.normalize(logits_per_text, p=2, dim=1)
+
+        # Calculate logits
+        logits = torch.matmul(logits_per_image, logits_per_text.t()) / self.temperature
+        labels = torch.arange(logits.size(0), device=logits.device)
+        
+        # Apply label smoothing
+        N = logits.size(0)
+        smoothed_labels = torch.full_like(logits, self.smoothing / (N - 1))
+        smoothed_labels.scatter_(1, labels.unsqueeze(1), 1.0 - self.smoothing)
+
+        # Calculate loss manually using log-softmax and smoothed labels
+        log_probs = F.log_softmax(logits, dim=1)
+        loss_img = -(smoothed_labels * log_probs).sum(dim=1).mean()
+
+        log_probs = F.log_softmax(logits.t(), dim=1)
+        loss_txt = -(smoothed_labels * log_probs).sum(dim=1).mean()
+
+        return (loss_img + loss_txt) / 2
+```
+
+----
 ⬇️ Download my best-performing fine-tune (see Update 12/June/24) here: 
 - ⬇️ [https://huggingface.co/zer0int/CLIP-GmP-ViT-L-14](https://huggingface.co/zer0int/CLIP-GmP-ViT-L-14)
 - It's a state-dict; use with ComfyUI as-is, or load it as the state_dict of the original ViT-L/14 for inference, to fine-tune, etc.
