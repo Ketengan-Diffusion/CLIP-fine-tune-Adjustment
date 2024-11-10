@@ -4,7 +4,7 @@ This fork is including:
 - PyCapsule_New called with null pointer Error due to messy dataset that has broken image on your folder
 - Included CSVMaker, so you don't need chatgpting anymore :)
 - Experimental ViT-G training. This CLIP model is user friendly with consumer GPU card. So our plan is to modify the script to be able run on multi-gpu or HPC cluster
-- Smooth-GmP Clip L fine-tuning with multi-gpu support through accelerate. To launch it you can use `accelerate launch exp-acts-ft-SMOOTH-finetune-OpenAI-CLIP-ViT-L-14-GmP.py`
+- Smooth-GmP Clip L fine-tuning with multi-gpu support through accelerate. To launch it you can use `accelerate launch acc-exp-acts-ft-SMOOTH-finetune-OpenAI-CLIP-ViT-L-14-GmP.py`
 
 
 ___
