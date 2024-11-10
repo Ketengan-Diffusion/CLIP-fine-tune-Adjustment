@@ -1,21 +1,66 @@
 import os
 import json
 import torch
-from torch.utils.data import Dataset, DataLoader
-from torchvision.io import read_image
-from PIL import Image
-from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torch.nn.functional as F
-from sklearn.metrics import f1_score, accuracy_score
+from PIL import Image
+from torch import nn
+from torch.optim.lr_scheduler import OneCycleLR
+import random
+import open_clip
+from torch.cuda.amp import autocast, GradScaler
 import warnings
 warnings.filterwarnings("ignore")
-import matplotlib
-matplotlib.use('Agg')
+from sklearn.metrics import accuracy_score, f1_score
+
+# Initialize basic variables
+training_losses = []
+validation_losses = []
+print("\n")
+
+# Create necessary folders
+plots_folder = 'ft-plots'
+ft_checkpoints_folder = 'ft-checkpoints'
+text_logs_folder = 'ft-logs'
+os.makedirs(plots_folder, exist_ok=True)
+os.makedirs(ft_checkpoints_folder, exist_ok=True)
+os.makedirs(text_logs_folder, exist_ok=True)
+
+# Model setup
+clipmodel = 'ViT-bigG-14'
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+# Load model with proper precision handling
+model, preprocess_train, preprocess_val = open_clip.create_model_and_transforms(
+    model_name=clipmodel,
+    pretrained='laion2b_s39b_b160k',
+    device=device,
+    precision='fp32'
+)
+
+# Move model to GPU and set precision
+model = model.to(device)
+model = model.float()
+
+# Print model info
+print(f"Model Type: {model.__class__.__name__}")
+print(f"Model Parameters Precision: {next(model.parameters()).dtype}")
+print(f"Device: {device}")
+
+# But replace clip.tokenize with:
+def tokenize_text(text):
+    tokenizer = open_clip.get_tokenizer(clipmodel)
+    return tokenizer(text)
+
+# Update the ImageTextDataset class tokenization:
+class ImageTextDataset(Dataset):
+    def __getitem__(self, idx):
+        # ... other code ...
+        text = tokenize_text([label])
+        return image, text.squeeze(0)
+
 import matplotlib.pyplot as plt
-from transformers import CLIPModel
-from transformers import CLIPProcessor
+from open_clip import create_model_and_transforms, get_tokenizer
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 import random
@@ -46,7 +91,7 @@ def adjust_unfreeze_rate(epoch, adjust_after=12, increase_rate=2):
     else:
         return increase_rate  # Increased rate after initial pass
 
-def unfreeze_layers(model, epoch, total_layers=32, unfreeze_all=False):
+def unfreeze_layers(model, epoch, total_layers=24, unfreeze_all=False):
     if unfreeze_all:
         for param in model.parameters():
             param.requires_grad = True
@@ -55,11 +100,10 @@ def unfreeze_layers(model, epoch, total_layers=32, unfreeze_all=False):
         layers_to_unfreeze = (epoch // unfreeze_every_n_epochs) % total_layers
         layers_to_unfreeze = min(layers_to_unfreeze, total_layers)
         for i, (name, param) in enumerate(model.named_parameters()):
-            if 'vision_model' in name:
-                if i >= total_layers - layers_to_unfreeze:
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
+            if i >= total_layers - layers_to_unfreeze:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
 
 def monitor_gradient_norms(gradient_norms, threshold=1e-5):
     alert_messages = []
@@ -75,13 +119,7 @@ def monitor_gradient_norms(gradient_norms, threshold=1e-5):
         # Optionally, you could also implement some automatic adjustment strategies here
 
 def plot_gradient_norms(gradient_norms, epoch, use_log_scale=True):
-    try:
-        plt.figure(figsize=(20, 10))
-
-    except:
-        print(f"Error in plotting gradient norms: {e}")
-        with open(f"{plots_folder}/gradient_norms_epoch_{epoch}.json", 'w') as f:
-            json.dump(gradient_norms, f)
+    plt.figure(figsize=(20, 10))
     
     # Choose a colormap
     cmap = plt.get_cmap('Spectral')
@@ -144,10 +182,9 @@ def calculate_metrics(logits, ground_truth):
     return acc, f1
 
 class ImageTextDataset(Dataset):
-    def __init__(self, image_folder, annotations_file, processor, max_length=77):
+    def __init__(self, image_folder, annotations_file, transform=None):
         self.image_folder = image_folder
-        self.processor = processor
-        self.max_length = max_length
+        self.transform = transform
         with open(annotations_file, 'r') as f:
             self.annotations = json.load(f)
         self.image_paths = list(self.annotations.keys())
@@ -157,25 +194,30 @@ class ImageTextDataset(Dataset):
 
     def __getitem__(self, idx):
         image_path = os.path.join(self.image_folder, self.image_paths[idx])
-        image = Image.open(image_path).convert('RGB')
+        image = Image.open(image_path).convert('RGB')  # Convert to RGB
+        if self.transform:
+            image = self.transform(image)
 
         labels = self.annotations[self.image_paths[idx]]
         
         if len(labels) >= 2:
             label = random.choice([labels[0], labels[1]])
         elif labels:
-            label = labels[0]
+            label = labels[0]  # Fallback to the first label if less than 2 are available
         else:
-            label = ''
+            label = ''  # Fallback if no labels are available
 
-        inputs = self.processor(images=image, text=label, return_tensors="pt", padding="max_length", truncation=True, max_length=self.max_length)
-        return inputs['pixel_values'].squeeze(0).half(), inputs['input_ids'].squeeze(0)  # Convert image to half precision
+        text = tokenize_text([label])  # Tokenize the label
 
+        return image, text.squeeze(0)  # Remove the extra dimension
+
+# You can adjust the "smoothing" factor and experiment around here.
+# Adjusting the temperature is NOT recommended.
 class ContrastiveLoss(nn.Module):
-    def __init__(self, temperature=0.07):
+    def __init__(self, temperature=0.07, smoothing=0.1):
         super(ContrastiveLoss, self).__init__()
         self.temperature = temperature
-        self.criterion = nn.CrossEntropyLoss()
+        self.smoothing = smoothing
 
     def forward(self, logits_per_image, logits_per_text):
         # Normalize the features to avoid overflow or underflow
@@ -185,10 +227,18 @@ class ContrastiveLoss(nn.Module):
         # Calculate logits
         logits = torch.matmul(logits_per_image, logits_per_text.t()) / self.temperature
         labels = torch.arange(logits.size(0), device=logits.device)
+        
+        # Apply label smoothing
+        N = logits.size(0)
+        smoothed_labels = torch.full_like(logits, self.smoothing / (N - 1))
+        smoothed_labels.scatter_(1, labels.unsqueeze(1), 1.0 - self.smoothing)
 
-        # Calculate loss as the mean of the two cross-entropy losses
-        loss_img = self.criterion(logits, labels)
-        loss_txt = self.criterion(logits.t(), labels)
+        # Calculate loss manually using log-softmax and smoothed labels
+        log_probs = F.log_softmax(logits, dim=1)
+        loss_img = -(smoothed_labels * log_probs).sum(dim=1).mean()
+
+        log_probs = F.log_softmax(logits.t(), dim=1)
+        loss_txt = -(smoothed_labels * log_probs).sum(dim=1).mean()
 
         return (loss_img + loss_txt) / 2
 
@@ -208,7 +258,7 @@ class FeatureScalerHook:
         return output
 
     def register_hook(self):
-        layer = self.model.vision_model.encoder.layers[self.layer_idx].mlp.fc1
+        layer = self.model.visual.transformer.resblocks[self.layer_idx].mlp.c_fc
         self.handle = layer.register_forward_hook(self.hook_fn)
 
     def remove(self):
@@ -233,70 +283,86 @@ def remove_hooks(hooks):
 # When scaled to x1000, CLIP will predict mainly adverbs for any image.
 # See https://github.com/zer0int/Golden-Gate-CLIP for details
 modified_neurons_layers = {
-    31: [281],
-    28: [168, 1297],
-    30: [2432]
+    23: [281],
+    20: [168, 1297],
+    22: [2432]
 }
+
+# Easiest way to disable: Simply set all scale factors to 1. 
 scale_factors = {
-    31: 100,
-    28: 100,
-    30: 1000
+    23: 100,
+    20: 100,
+    22: 1000
 }
 
 contrastive_loss = ContrastiveLoss(temperature=0.07)
-from torch.cuda.amp import autocast, GradScaler
 scaler = GradScaler()
 
-clipmodel = 'laion/CLIP-ViT-bigG-14-laion2B-39B-b160k'
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = CLIPModel.from_pretrained(clipmodel).to(device).half()  # Convert model to half precision
-processor = CLIPProcessor.from_pretrained(clipmodel)
+# Update model name for ViT-bigG
+clipmodel = 'ViT-bigG-14'
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-def preprocess(images, texts):
-    inputs = processor(text=texts, images=images, return_tensors="pt", padding=True, truncation=True)
-    return inputs['pixel_values'], inputs['input_ids']
+# Load the ViT-bigG model with LAION-2B pretrained weights
+model, preprocess_train, preprocess_val = create_model_and_transforms(
+    model_name=clipmodel,
+    pretrained='laion2b_s39b_b160k',
+    device=device,
+    precision='fp32'  # Using full precision for better accuracy on H100
+)
+
+# Move model to GPU
+model = model.to(device)
 
 #For continuing training a model checkpoint
-model = torch.load("ft-checkpoints/clip_ft_100.pt")
-model = model.to(device)
-processor = CLIPProcessor.from_pretrained(clipmodel)
+# model = torch.load("ft-checkpoints/clip_ft_100.pt")
+# model = model.to(device)
+# processor = CLIPProcessor.from_pretrained(clipmodel)
 
 unfreeze_all = True
 
 EPOCHS = 20
-batch_size = 20
 max_learning_rate = 1e-7
 learning_rate = 5e-8
+batch_size = 48
 
-# Define your training dataset and dataloader, or use below to reproduce results
-max_length = 77  # CLIP's default max length
-dataset1 = ImageTextDataset("G:\SomniumSC2-datasets", "G:\SomniumSC2-datasets\my-dataset-labels.json", processor, max_length=max_length)
-concatenated_dataset = ConcatDataset([dataset1])
+# Define your training dataset and dataloader
+dataset1 = ImageTextDataset(
+    "F:\SomniumSC2-datasets",
+    "F:\SomniumSC2-datasets\my-dataset-labels.json",
+    transform=preprocess_train
+)
+
+concatenated_dataset = ConcatDataset([dataset1])  # Add more datasets to this list as needed ([dataset1, dataset2]) 
 train_dataloader = DataLoader(concatenated_dataset, batch_size=batch_size, shuffle=True)
-val_dataset = ImageTextDataset("G:\Validation", "G:\Validation\my-dataset-labels.json", processor, max_length=max_length)
+# Validation dataset and dataloader
+val_dataset = ImageTextDataset("J:/Validation", "J:/Validation/my-dataset-labels.json", transform=preprocess_val)
 val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
 total_steps = len(train_dataloader) * EPOCHS
 
 # Define parameter groups for different learning rates
-visual_parameters = [p for n, p in model.named_parameters() if 'visual' in n and p.requires_grad]
-text_parameters = [p for n, p in model.named_parameters() if 'text' in n and p.requires_grad]
-other_parameters = [p for n, p in model.named_parameters() if 'visual' not in n and 'text' not in n and p.requires_grad]
+visual_parameters = [p for p in model.visual.transformer.parameters() if p.requires_grad]
+transformer_parameters = [p for p in model.transformer.parameters() if p.requires_grad]
 
+# Taming CLIP after we modify its weights in such a radical way, with differential learning rates 
 param_groups = [
-    {'params': visual_parameters, 'lr': 1e-7},
-    {'params': text_parameters, 'lr': 5e-8},
-    {'params': other_parameters, 'lr': 1e-7},
+    {'params': visual_parameters, 'lr': 2e-7},
+    {'params': transformer_parameters, 'lr': 5e-9},
+    {'params': model.token_embedding.parameters(), 'lr': 2e-7},
+    {'params': [model.positional_embedding, model.visual.positional_embedding, model.visual.class_embedding], 'lr': 8e-9},
+    {'params': [model.visual.proj, model.text_projection], 'lr': 1e-7},
+    {'params': [model.visual.ln_pre.weight, model.visual.ln_pre.bias, model.visual.ln_post.weight, model.visual.ln_post.bias], 'lr': 8e-8}, # Delicate linear layers
+    {'params': [model.ln_final.weight, model.ln_final.bias, model.visual.conv1.weight], 'lr': 8e-9}  # Further reduce learning rate for problematic layers
 ]
 
-accumulation_steps = 4  # Effective batch size will be batch_size * accumulation_steps
+accumulation_steps = 8  # Effective batch size will be batch_size * accumulation_steps
 
-optimizer = AdaBelief([p for p in model.parameters() if p.requires_grad], lr=learning_rate, eps=1e-14, betas=(0.9, 0.999), weight_decay=1e-3, weight_decouple=True, rectify=True, print_change_log=False)
+optimizer = AdaBelief(param_groups, lr=learning_rate, eps=1e-14, betas=(0.9, 0.999), weight_decay=1e-4, weight_decouple=True, rectify=True, print_change_log=False)
 
 scheduler = OneCycleLR(optimizer, max_lr=max_learning_rate, total_steps=total_steps, pct_start=0.3, anneal_strategy='cos')
 
 model = model.float()
 
-print(f"Precision: {model.dtype}")
 print(f'Total batches: {len(train_dataloader)} @ Batch Size: {batch_size}')
 print("== START == \n")
 
@@ -305,21 +371,23 @@ def trainloop():
     logits_images = []
     logits_texts = []
 
-    accumulation_steps = 2  # Adjust as needed to simulate larger batch size
+    # Initialize all required lists correctly
+    train_accs = []
+    train_f1s = []
+    val_accs = []
+    val_f1s = []
+
+    accumulation_steps = 2
     scaler = GradScaler()
-    # Register hooks to tamper with activation value
     hooks = register_hooks(model, modified_neurons_layers, scale_factors)
+    
     for epoch in range(EPOCHS):
         gradient_norms = {}
         unfreeze_layers(model, epoch, total_layers=24, unfreeze_all=unfreeze_all)
         model.train()
         total_train_loss = 0.0
-        train_accs, train_f1s, val_accs, val_f1s = [], [], [], []
-        train_dataloader_prog = train_dataloader
-        train_dataloader_all = train_dataloader
+        
         progress_bar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f'Epoch {epoch + 1}/{EPOCHS}', leave=True)
-
-        optimizer.zero_grad()  # Reset gradients at the beginning of the epoch
 
         for batch_idx, (images, texts) in progress_bar:
             images, texts = images.to(device), texts.to(device)
@@ -327,9 +395,13 @@ def trainloop():
             batch_logits_texts = []
 
             with autocast():
-                outputs = model(pixel_values=images, input_ids=texts)
-                logits_per_image = outputs.logits_per_image
-                logits_per_text = outputs.logits_per_text
+                # OpenCLIP model returns (image_features, text_features, logit_scale)
+                image_features, text_features, logit_scale = model(images, texts)
+                
+                # Calculate logits manually
+                logits_per_image = (logit_scale * image_features @ text_features.T)
+                logits_per_text = logits_per_image.T
+
                 current_batch_size = images.size(0)
                 ground_truth = torch.arange(current_batch_size, device=device)
                 total_loss = contrastive_loss(logits_per_image, logits_per_text)
@@ -340,11 +412,9 @@ def trainloop():
             scaler.scale(total_loss).backward()
 
             if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_dataloader):
-                scaler.unscale_(optimizer)
-                clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
+                optimizer.zero_grad()  # Reset gradients after optimizer step
                 scheduler.step()
 
             batch_logits_images.append(logits_per_image.mean().item())
@@ -381,12 +451,17 @@ def trainloop():
         print("Running Validation...")
         with torch.no_grad():
             for images, texts in val_dataloader:
-                images, texts = images.to(device), texts.to(device)
-                outputs = model(pixel_values=images, input_ids=texts)
-                logits_per_image = outputs.logits_per_image
-                logits_per_text = outputs.logits_per_text
                 current_batch_size = images.size(0)
                 ground_truth = torch.arange(current_batch_size, device=device)
+                images, texts = images.to(device), texts.to(device)
+                
+                # Handle OpenCLIP's 3 return values
+                image_features, text_features, logit_scale = model(images, texts)
+                
+                # Calculate logits manually
+                logits_per_image = (logit_scale * image_features @ text_features.T)
+                logits_per_text = logits_per_image.T
+                
                 val_loss = contrastive_loss(logits_per_image, logits_per_text)
                 total_val_loss += val_loss.item()
                 val_acc, val_f1 = calculate_metrics(logits_per_image, ground_truth)
@@ -423,7 +498,7 @@ def trainloop():
             f.write(f"Epoch {epoch + 1}/{EPOCHS} - Training Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}\n")
             f.write("============================================================\n")
 
-        if (epoch + 1) % 1 == 0 or epoch == EPOCHS - 1:
+        if (epoch + 1) % 5 == 0 or epoch == EPOCHS - 1:
             model_path = f"{ft_checkpoints_folder}/clip_ft_{epoch+1}.pt"
             remove_hooks(hooks)# Remove hooks
             torch.save(model, model_path)
